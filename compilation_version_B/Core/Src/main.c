@@ -32,16 +32,55 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* ----- Open-loop sinusoidal spin parameters (STGIPN3H60T 3-phase IPM) ----- */
-/* TIM1 timer clock = 16 MHz, center-aligned: f_pwm = 16e6 / (2 * PWM_ARR).
- * PWM_ARR = 400 -> 20 kHz PWM. (The CubeMX default of 65535 gives ~122 Hz,
- * which is a scope smoke-test value, far too slow to drive a motor.) */
-#define PWM_ARR            400u
+/* ----- Open-loop V/Hz sinusoidal drive (STGIPN3H60T IPM, Mitsubishi
+ * HC-KFS13 PMSM servo) -----
+ * TIM1 timer clock = 16 MHz, center-aligned: f_pwm = 16e6 / (2 * PWM_ARR).
+ * PWM_ARR = 400 -> 20 kHz PWM. */
+#define PWM_ARR                  400u
 
-/* Fixed high-side duty cycle applied to all three phases (no rotation).
- * Center-aligned, so CCR = PWM_ARR * duty.  0.20 -> 20%. */
-#define FIXED_DUTY         0.20f
-#define FIXED_DUTY_CCR     ((uint32_t)(PWM_ARR * FIXED_DUTY))
+/* HC-KFS13 is a 100 W, 200 Vac-class PMSM (0.71 A / 3000 r/min rated, per
+ * Mitsubishi's published specs). Its exact pole-pair count isn't in the
+ * generally available manuals; 4 pole pairs (8 poles) is typical for this
+ * small low-inertia Mitsubishi servo class and used below purely to relate
+ * electrical frequency to an approximate mechanical speed in comments --
+ * open-loop drive correctness doesn't depend on it. Verify against the
+ * motor nameplate/manual if the exact RPM matters. */
+#define MOTOR_POLE_PAIRS         4u
+
+/* One electrical cycle, values in [-1, 1]. 96 so that a 120-degree phase
+ * shift is an exact 32-sample index offset (96 / 3), avoiding any
+ * interpolation/rounding error between the three phases. */
+#define SINE_LUT_SIZE            96u
+
+/* TIM1 runs center-aligned, so the update event fires on both the up- and
+ * down-count each PWM period -> 2x the 20 kHz carrier. */
+#define PWM_UPDATE_HZ            40000.0f
+#define LUT_STEP_PER_HZ          ((float)SINE_LUT_SIZE / PWM_UPDATE_HZ)
+
+/* Open-loop start-up ramp: electrical frequency ramps 0 -> ELEC_FREQ_TARGET_HZ
+ * over RAMP_TIME_S seconds; modulation index (PWM duty amplitude) ramps
+ * alongside it from a fixed low-speed boost (M_START, to overcome resistive
+ * drop/static friction while electrical frequency is near 0) up to
+ * M_TARGET. No encoder feedback and no current limiting: this only proves
+ * the waveform is a genuine rotating field, it is not closed-loop servo
+ * control. Keep M_TARGET conservative until current has been verified on
+ * the phase shunts (IU/IV/IW) with a scope. */
+#define ELEC_FREQ_TARGET_HZ      20.0f     /* -> ~300 r/min @ 4 pole pairs */
+#define RAMP_TIME_S              5.0f
+#define M_START                  0.10f
+#define M_TARGET                 0.80f
+#define RAMP_STEP_PER_TICK       (1.0f / (RAMP_TIME_S * PWM_UPDATE_HZ))
+
+/* ----- RS485 daisy-chain ping/pong (USART2, shared TX/RX bus over both
+ * RJ45 jacks) ----- */
+#define DC_FRAME_LEN             8u
+#define DC_SYNC0                 0xAAu
+#define DC_SYNC1                 0x55u
+#define DC_TYPE_PING             0x01u
+#define DC_TYPE_PONG             0x02u
+#define DC_PING_PERIOD_MS        1000u
+#define DC_LED_BLINK_MS          80u
+#define DC_RX_BUF_LEN            64u
 
 /* USER CODE END PD */
 
@@ -76,7 +115,13 @@ static void MX_SPI1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void Motor_PWM_Update(void);
+static void DaisyChain_Init(void);
+static void DaisyChain_Send(uint8_t type);
+static void DaisyChain_ProcessRx(void);
+static void DaisyChain_Poll(void);
+static void DaisyChain_BlinkLed(void);
+static uint32_t DaisyChain_Rand(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -120,13 +165,16 @@ int main(void)
   MX_ADC2_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* Fixed 20% duty on all three phases through the STGIPN3H60T IPM.
+  /* Sinusoidal open-loop drive through the STGIPN3H60T IPM.
    *   PA8/PB13  = HIN1/LIN1 -> phase U
    *   PA9/PB14  = HIN2/LIN2 -> phase V
    *   PA10/PB15 = HIN3/LIN3 -> phase W
    * TIM1 produces the complementary HIN/LIN pairs with dead-time; the IPM
-   * inputs are active-high. All phases share the same duty -> equal phase
-   * voltages -> no winding current (power-stage / scope verification only). */
+   * inputs are active-high. Motor_PWM_Update() (called from the TIM1 update
+   * interrupt) drives each phase with a 120-degree-shifted sine, ramping
+   * frequency and amplitude together -- a genuine rotating field, unlike
+   * the previous equal-duty smoke test which produced zero line-to-line
+   * voltage and no torque. */
 
   /* Hold PA5 (NSD_ADC) high at all times to keep the current/voltage-sense
    * signal conditioning out of shutdown. It defaults to a plain input;
@@ -146,13 +194,11 @@ int main(void)
    * (R12/C16) into the IPM's CIN pin, the analog overcurrent-comparator
    * input that gates the U-channel driver specifically. Driving it high
    * holds CIN above its trip threshold, permanently faulting out U while
-   * leaving V/W unaffected. Keep it low so CIN stays below threshold. */
+   * leaving V/W unaffected. Keep it low so CIN stays below threshold.
+   * NOTE: this also means the IPM's own overcurrent comparator can never
+   * trip (CIN is held below threshold at all times) -- there is no
+   * hardware or software current protection on this drive. */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET);
-
-  /* Apply the fixed 20% duty to all three high sides. */
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, FIXED_DUTY_CCR);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, FIXED_DUTY_CCR);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, FIXED_DUTY_CCR);
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
@@ -160,6 +206,11 @@ int main(void)
   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+  HAL_TIM_Base_Start_IT(&htim1);
+
+  /* RS485 daisy-chain ping/pong discovery (USART2, shared bus over both
+   * RJ45 jacks). */
+  DaisyChain_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -182,7 +233,9 @@ int main(void)
       HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
     }
 
-    /* Duty is fixed (set once before the loop) — nothing to update here. */
+    /* U/V/W duty is updated from the TIM1 update interrupt (Motor_PWM_Update) —
+     * nothing to do for the motor drive here. */
+    DaisyChain_Poll();
   }
   /* USER CODE END 3 */
 }
@@ -620,6 +673,216 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/* ===== Open-loop sinusoidal V/Hz motor drive ============================ */
+
+/* One electrical cycle, generated offline: sinf(2*pi*i/SINE_LUT_SIZE). */
+static const float sine_lut[SINE_LUT_SIZE] =
+{
+  0.000000f, 0.065403f, 0.130526f, 0.195090f, 0.258819f, 0.321439f, 0.382683f, 0.442289f,
+  0.500000f, 0.555570f, 0.608761f, 0.659346f, 0.707107f, 0.751840f, 0.793353f, 0.831470f,
+  0.866025f, 0.896873f, 0.923880f, 0.946930f, 0.965926f, 0.980785f, 0.991445f, 0.997859f,
+  1.000000f, 0.997859f, 0.991445f, 0.980785f, 0.965926f, 0.946930f, 0.923880f, 0.896873f,
+  0.866025f, 0.831470f, 0.793353f, 0.751840f, 0.707107f, 0.659346f, 0.608761f, 0.555570f,
+  0.500000f, 0.442289f, 0.382683f, 0.321439f, 0.258819f, 0.195090f, 0.130526f, 0.065403f,
+  0.000000f, -0.065403f, -0.130526f, -0.195090f, -0.258819f, -0.321439f, -0.382683f, -0.442289f,
+  -0.500000f, -0.555570f, -0.608761f, -0.659346f, -0.707107f, -0.751840f, -0.793353f, -0.831470f,
+  -0.866025f, -0.896873f, -0.923880f, -0.946930f, -0.965926f, -0.980785f, -0.991445f, -0.997859f,
+  -1.000000f, -0.997859f, -0.991445f, -0.980785f, -0.965926f, -0.946930f, -0.923880f, -0.896873f,
+  -0.866025f, -0.831470f, -0.793353f, -0.751840f, -0.707107f, -0.659346f, -0.608761f, -0.555570f,
+  -0.500000f, -0.442289f, -0.382683f, -0.321439f, -0.258819f, -0.195090f, -0.130526f, -0.065403f,
+};
+
+static float motor_phase_idx = 0.0f;   /* current position in sine_lut, wraps at SINE_LUT_SIZE */
+static float motor_ramp_frac = 0.0f;   /* 0..1 progress through the start-up ramp */
+
+static void Motor_PWM_Update(void)
+{
+  if (motor_ramp_frac < 1.0f)
+  {
+    motor_ramp_frac += RAMP_STEP_PER_TICK;
+    if (motor_ramp_frac > 1.0f)
+    {
+      motor_ramp_frac = 1.0f;
+    }
+  }
+
+  float elec_freq_now = motor_ramp_frac * ELEC_FREQ_TARGET_HZ;
+  float m_now = M_START + motor_ramp_frac * (M_TARGET - M_START);
+
+  motor_phase_idx += elec_freq_now * LUT_STEP_PER_HZ;
+  if (motor_phase_idx >= (float)SINE_LUT_SIZE)
+  {
+    motor_phase_idx -= (float)SINE_LUT_SIZE;
+  }
+
+  uint32_t idx_u = (uint32_t)motor_phase_idx % SINE_LUT_SIZE;
+  uint32_t idx_v = (idx_u + SINE_LUT_SIZE - SINE_LUT_SIZE / 3u) % SINE_LUT_SIZE;
+  uint32_t idx_w = (idx_u + SINE_LUT_SIZE / 3u) % SINE_LUT_SIZE;
+
+  uint32_t ccu = (uint32_t)((float)(PWM_ARR / 2u) * (1.0f + m_now * sine_lut[idx_u]));
+  uint32_t ccv = (uint32_t)((float)(PWM_ARR / 2u) * (1.0f + m_now * sine_lut[idx_v]));
+  uint32_t ccw = (uint32_t)((float)(PWM_ARR / 2u) * (1.0f + m_now * sine_lut[idx_w]));
+
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccu);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccv);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccw);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM1)
+  {
+    Motor_PWM_Update();
+  }
+}
+
+/* ===== RS485 daisy-chain ping/pong ======================================= */
+
+static uint32_t board_id;
+
+static uint8_t dc_rx_byte;                /* landing pad for HAL_UART_Receive_IT */
+static uint8_t dc_rx_ring[DC_RX_BUF_LEN];
+static volatile uint16_t dc_rx_head = 0;  /* written by the RX-complete ISR */
+static uint16_t dc_rx_tail = 0;           /* read by the main loop */
+
+static uint32_t dc_rand_state;
+static uint32_t dc_next_ping_tick = 0;
+static uint32_t dc_led_off_tick = 0;
+static uint32_t dc_pong_due_tick = 0;
+static uint8_t dc_pong_pending = 0;
+
+static uint32_t DaisyChain_Rand(void)
+{
+  /* Numerical Recipes LCG: enough randomness to stagger bus access on a
+   * shared half-duplex link, not intended to be cryptographically sound. */
+  dc_rand_state = dc_rand_state * 1664525u + 1013904223u;
+  return dc_rand_state;
+}
+
+static void DaisyChain_BlinkLed(void)
+{
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET); /* LED2 */
+  dc_led_off_tick = HAL_GetTick() + DC_LED_BLINK_MS;
+}
+
+static void DaisyChain_Send(uint8_t type)
+{
+  uint8_t frame[DC_FRAME_LEN];
+  frame[0] = DC_SYNC0;
+  frame[1] = DC_SYNC1;
+  frame[2] = type;
+  frame[3] = (uint8_t)(board_id);
+  frame[4] = (uint8_t)(board_id >> 8);
+  frame[5] = (uint8_t)(board_id >> 16);
+  frame[6] = (uint8_t)(board_id >> 24);
+  frame[7] = (uint8_t)(frame[2] ^ frame[3] ^ frame[4] ^ frame[5] ^ frame[6]);
+  HAL_UART_Transmit(&huart2, frame, DC_FRAME_LEN, 20);
+}
+
+static void DaisyChain_ProcessRx(void)
+{
+  for (;;)
+  {
+    uint16_t head = dc_rx_head;
+    uint16_t available = (uint16_t)((head + DC_RX_BUF_LEN - dc_rx_tail) % DC_RX_BUF_LEN);
+    if (available < DC_FRAME_LEN)
+    {
+      break;
+    }
+
+    uint8_t b0 = dc_rx_ring[dc_rx_tail];
+    uint8_t b1 = dc_rx_ring[(dc_rx_tail + 1u) % DC_RX_BUF_LEN];
+    if (b0 != DC_SYNC0 || b1 != DC_SYNC1)
+    {
+      dc_rx_tail = (uint16_t)((dc_rx_tail + 1u) % DC_RX_BUF_LEN); /* resync: drop one byte */
+      continue;
+    }
+
+    uint8_t frame[DC_FRAME_LEN];
+    for (uint32_t i = 0; i < DC_FRAME_LEN; i++)
+    {
+      frame[i] = dc_rx_ring[(dc_rx_tail + i) % DC_RX_BUF_LEN];
+    }
+
+    uint8_t checksum = (uint8_t)(frame[2] ^ frame[3] ^ frame[4] ^ frame[5] ^ frame[6]);
+    if (checksum != frame[7])
+    {
+      dc_rx_tail = (uint16_t)((dc_rx_tail + 1u) % DC_RX_BUF_LEN); /* resync: bad checksum */
+      continue;
+    }
+
+    dc_rx_tail = (uint16_t)((dc_rx_tail + DC_FRAME_LEN) % DC_RX_BUF_LEN);
+
+    uint32_t sender_id = (uint32_t)frame[3] | ((uint32_t)frame[4] << 8) |
+                          ((uint32_t)frame[5] << 16) | ((uint32_t)frame[6] << 24);
+    if (sender_id == board_id)
+    {
+      continue; /* ignore any echo of our own transmission */
+    }
+
+    DaisyChain_BlinkLed();
+
+    if (frame[2] == DC_TYPE_PING)
+    {
+      /* Randomized backoff before replying: the TX pair is a shared bus
+       * with no collision detection, so every board replying to a
+       * broadcast ping at the same instant would collide. */
+      dc_pong_due_tick = HAL_GetTick() + 1u + (DaisyChain_Rand() % 15u);
+      dc_pong_pending = 1;
+    }
+  }
+}
+
+static void DaisyChain_Init(void)
+{
+  board_id = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
+
+  dc_rand_state = board_id ^ HAL_GetTick() ^ 0xA5A5A5A5u;
+  if (dc_rand_state == 0u)
+  {
+    dc_rand_state = 0xDEADBEEFu; /* LCG must not start at 0 */
+  }
+
+  /* Stagger the first ping so boards that power up together don't all
+   * transmit in the same instant. */
+  dc_next_ping_tick = HAL_GetTick() + (DaisyChain_Rand() % DC_PING_PERIOD_MS);
+
+  HAL_UART_Receive_IT(&huart2, &dc_rx_byte, 1);
+}
+
+static void DaisyChain_Poll(void)
+{
+  DaisyChain_ProcessRx();
+
+  if (dc_pong_pending && (int32_t)(HAL_GetTick() - dc_pong_due_tick) >= 0)
+  {
+    DaisyChain_Send(DC_TYPE_PONG);
+    dc_pong_pending = 0;
+  }
+
+  if ((int32_t)(HAL_GetTick() - dc_next_ping_tick) >= 0)
+  {
+    DaisyChain_Send(DC_TYPE_PING);
+    dc_next_ping_tick = HAL_GetTick() + DC_PING_PERIOD_MS;
+  }
+
+  if (dc_led_off_tick != 0u && (int32_t)(HAL_GetTick() - dc_led_off_tick) >= 0)
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+    dc_led_off_tick = 0u;
+  }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    dc_rx_ring[dc_rx_head] = dc_rx_byte;
+    dc_rx_head = (uint16_t)((dc_rx_head + 1u) % DC_RX_BUF_LEN);
+    HAL_UART_Receive_IT(&huart2, &dc_rx_byte, 1);
+  }
+}
 
 /* USER CODE END 4 */
 
