@@ -15,8 +15,8 @@ import serial
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyUSB0"
-BAUD = 57600
+PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"   # ESP32-C3 native USB
+BAUD = 115200   # ESP32 bridge (was 57600 for the old Arduino SoftwareSerial bridge)
 WINDOW = 200  # number of samples shown
 
 pat = re.compile(r"VDC,(\d+),VU,(\d+),VV,(\d+),VW,(\d+),IU,(\d+),IV,(\d+),IW,(\d+)")

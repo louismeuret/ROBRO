@@ -1,4 +1,4 @@
-ARM GAS  /tmp/ccoSISse.s 			page 1
+ARM GAS  /tmp/cct2WfSz.s 			page 1
 
 
    1              		.cpu cortex-m4
@@ -58,7 +58,7 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
   28:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****     [..] RAM functions are defined using a specific toolchain keyword "__ramfunc".
   29:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c **** 
   30:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****     *** GNU Compiler ***
-ARM GAS  /tmp/ccoSISse.s 			page 2
+ARM GAS  /tmp/cct2WfSz.s 			page 2
 
 
   31:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****     --------------------
@@ -118,7 +118,7 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
   85:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****   */
   86:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c **** 
   87:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c **** /**
-ARM GAS  /tmp/ccoSISse.s 			page 3
+ARM GAS  /tmp/cct2WfSz.s 			page 3
 
 
   88:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****   * @brief  Enable the Power down in Run Mode
@@ -178,7 +178,7 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
  104:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****   * @retval None
  105:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****   */
  106:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c **** __RAM_FUNC HAL_StatusTypeDef HAL_FLASHEx_DisableRunPowerDown(void)
-ARM GAS  /tmp/ccoSISse.s 			page 4
+ARM GAS  /tmp/cct2WfSz.s 			page 4
 
 
  107:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c **** {
@@ -238,7 +238,7 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
  122:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****   *
  123:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****   * @param  DBankConfig The FLASH DBANK User Option Byte value.
  124:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****   *         This parameter  can be one of the following values:
-ARM GAS  /tmp/ccoSISse.s 			page 5
+ARM GAS  /tmp/cct2WfSz.s 			page 5
 
 
  125:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****   *            @arg OB_DBANK_128_BITS: Single-bank with 128-bits data
@@ -298,7 +298,7 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
  145              		.loc 1 143 20 is_stmt 0 view .LVU31
  146 0068 9B6C     		ldr	r3, [r3, #72]
  147              		.loc 1 143 8 view .LVU32
-ARM GAS  /tmp/ccoSISse.s 			page 6
+ARM GAS  /tmp/cct2WfSz.s 			page 6
 
 
  148 006a 9342     		cmp	r3, r2
@@ -358,7 +358,7 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
  160:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****         __HAL_FLASH_DATA_CACHE_DISABLE();
  186              		.loc 1 160 9 is_stmt 1 view .LVU46
  187 00a6 3B4B     		ldr	r3, .L19+4
-ARM GAS  /tmp/ccoSISse.s 			page 7
+ARM GAS  /tmp/cct2WfSz.s 			page 7
 
 
  188 00a8 1A68     		ldr	r2, [r3]
@@ -418,7 +418,7 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
  226 00e0 1B6B     		ldr	r3, [r3, #48]
  227              	.LVL6:
  176:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****       if (((reg & FLASH_WRP1BR_WRP1B_STRT) >> FLASH_WRP1BR_WRP1B_STRT_Pos) <=
-ARM GAS  /tmp/ccoSISse.s 			page 8
+ARM GAS  /tmp/cct2WfSz.s 			page 8
 
 
  228              		.loc 1 176 7 is_stmt 1 view .LVU60
@@ -478,7 +478,7 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
  265              		.loc 1 191 7 view .LVU72
  266              		.loc 1 191 11 is_stmt 0 view .LVU73
  267 011a 1E4B     		ldr	r3, .L19+4
-ARM GAS  /tmp/ccoSISse.s 			page 9
+ARM GAS  /tmp/cct2WfSz.s 			page 9
 
 
  268 011c 1B6D     		ldr	r3, [r3, #80]
@@ -538,7 +538,7 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
  306 0158 4FF47A72 		mov	r2, #1000
  307 015c 02FB03F3 		mul	r3, r2, r3
  308              	.LVL13:
-ARM GAS  /tmp/ccoSISse.s 			page 10
+ARM GAS  /tmp/cct2WfSz.s 			page 10
 
 
  309              	.L17:
@@ -598,7 +598,7 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
  343              		.loc 1 226 3 view .LVU98
  227:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c **** 
  228:Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_flash_ramfunc.c ****   return status;
-ARM GAS  /tmp/ccoSISse.s 			page 11
+ARM GAS  /tmp/cct2WfSz.s 			page 11
 
 
  344              		.loc 1 228 3 view .LVU99
@@ -631,20 +631,20 @@ ARM GAS  /tmp/ccoSISse.s 			page 1
  370              		.file 5 "Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_def.h"
  371              		.file 6 "Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_flash.h"
  372              		.file 7 "Drivers/CMSIS/Device/ST/STM32G4xx/Include/system_stm32g4xx.h"
-ARM GAS  /tmp/ccoSISse.s 			page 12
+ARM GAS  /tmp/cct2WfSz.s 			page 12
 
 
 DEFINED SYMBOLS
                             *ABS*:0000000000000000 stm32g4xx_hal_flash_ramfunc.c
-     /tmp/ccoSISse.s:18     .RamFunc:0000000000000000 $t
-     /tmp/ccoSISse.s:26     .RamFunc:0000000000000000 HAL_FLASHEx_EnableRunPowerDown
-     /tmp/ccoSISse.s:54     .RamFunc:0000000000000018 $d
-     /tmp/ccoSISse.s:60     .RamFunc:0000000000000024 $t
-     /tmp/ccoSISse.s:67     .RamFunc:0000000000000024 HAL_FLASHEx_DisableRunPowerDown
-     /tmp/ccoSISse.s:94     .RamFunc:000000000000003c $d
-     /tmp/ccoSISse.s:100    .RamFunc:0000000000000048 $t
-     /tmp/ccoSISse.s:107    .RamFunc:0000000000000048 HAL_FLASHEx_OB_DBankConfig
-     /tmp/ccoSISse.s:358    .RamFunc:0000000000000190 $d
+     /tmp/cct2WfSz.s:18     .RamFunc:0000000000000000 $t
+     /tmp/cct2WfSz.s:26     .RamFunc:0000000000000000 HAL_FLASHEx_EnableRunPowerDown
+     /tmp/cct2WfSz.s:54     .RamFunc:0000000000000018 $d
+     /tmp/cct2WfSz.s:60     .RamFunc:0000000000000024 $t
+     /tmp/cct2WfSz.s:67     .RamFunc:0000000000000024 HAL_FLASHEx_DisableRunPowerDown
+     /tmp/cct2WfSz.s:94     .RamFunc:000000000000003c $d
+     /tmp/cct2WfSz.s:100    .RamFunc:0000000000000048 $t
+     /tmp/cct2WfSz.s:107    .RamFunc:0000000000000048 HAL_FLASHEx_OB_DBankConfig
+     /tmp/cct2WfSz.s:358    .RamFunc:0000000000000190 $d
 
 UNDEFINED SYMBOLS
 pFlash

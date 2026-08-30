@@ -81,6 +81,60 @@
 #define DC_PING_PERIOD_MS        1000u
 #define DC_LED_BLINK_MS          80u
 #define DC_RX_BUF_LEN            64u
+#define DC_MAX_PEERS             4u     /* boards remembered in the peer table */
+
+/* ----- ESP32 telemetry / command link (SPI1, STM32 is master) -----
+ * All four signals land on the board's existing header, so nothing has to be
+ * soldered to the LED pads:
+ *
+ *   PB3 (GPIO4, SPI_SCK)  -> ESP32 SCLK
+ *   PA7 (GPIO6, SPI_MOSI) -> ESP32 MOSI   (telemetry out)
+ *   PB4 (GPIO5, SPI_MISO) <- ESP32 MISO   (commands in)
+ *   PB9 (free header pin) -> ESP32 CS     (software NSS, active low)
+ *   GND                   -- GND
+ *
+ * SPI was chosen because it is the only full-duplex link available on the
+ * reachable pins: PB3/PB4/PA14 all map to USART2, which is already driving the
+ * RS485 daisy chain, and PB9's UART partner (USART3_RX) is PB8-BOOT0.
+ *
+ * SPI1 was already configured by CubeMX as a full-duplex master with soft NSS
+ * and never used. Two changes are needed: 8-bit words instead of 4, and a
+ * slower clock -- 8 MHz is more than an ESP32 SPI slave will follow reliably.
+ *
+ * The exchange is symmetric and fixed length: every transfer clocks a
+ * telemetry frame out on MOSI while a command frame arrives on MISO. */
+#define ESP_FRAME_LEN            72u
+#define ESP_PERIOD_MS            50u    /* 20 exchanges per second */
+
+#define ESP_TX_SYNC0             0xA5u  /* STM32 -> ESP32 (telemetry) */
+#define ESP_TX_SYNC1             0x5Au
+#define ESP_RX_SYNC0             0xC3u  /* ESP32 -> STM32 (command)   */
+#define ESP_RX_SYNC1             0x3Cu
+
+#define ESP_CMD_NOP              0x00u
+#define ESP_CMD_SET_FREQ         0x01u  /* arg = centi-Hz      */
+#define ESP_CMD_SET_MOD          0x02u  /* arg = milli-units   */
+#define ESP_CMD_START            0x03u
+#define ESP_CMD_STOP             0x04u
+#define ESP_CMD_PING             0x05u
+#define ESP_CMD_SET_MOD_START    0x06u  /* arg = milli-units   */
+#define ESP_CMD_SET_RAMP_MS      0x07u  /* arg = milliseconds  */
+#define ESP_CMD_SET_DIR          0x08u  /* arg = 0 fwd, 1 rev  */
+#define ESP_CMD_SET_LED          0x09u  /* arg lo = led index, hi = mode */
+
+/* LED override modes for ESP_CMD_SET_LED. */
+#define ESP_LED_AUTO             0u
+#define ESP_LED_ON               1u
+#define ESP_LED_OFF              2u
+#define ESP_LED_COUNT            2u     /* 0 = LED1 (PB6), 1 = LED2 (PB7) */
+
+#define ESP_CS_PORT              GPIOB
+#define ESP_CS_PIN               GPIO_PIN_9
+
+/* The ESP32 slave needs CS stable a little before the first clock edge and
+ * after the last. ~1 us at 16 MHz; HAL_Delay's 1 ms granularity is far too
+ * coarse for this. */
+#define ESP_CS_SETTLE()          do { for (volatile uint32_t i_ = 0; i_ < 16u; i_++) { __NOP(); } } while (0)
 
 /* USER CODE END PD */
 
@@ -102,7 +156,8 @@ UART_HandleTypeDef huart2;
 PCD_HandleTypeDef hpcd_USB_FS;
 
 /* USER CODE BEGIN PV */
-
+static volatile uint8_t fault_15v = 0;       /* PA15: 1 = no 15V rail */
+static volatile uint32_t dc_peer_frames = 0; /* valid frames seen from other boards */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -115,13 +170,20 @@ static void MX_SPI1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
+static uint16_t ADC_ReadChannel(ADC_HandleTypeDef *hadc, uint32_t channel);
+static void Esp_Init(void);
+static void Esp_Poll(void);
+static void Esp_Exchange(void);
+static void Esp_ApplyCommand(const uint8_t *frame);
 static void Motor_PWM_Update(void);
 static void DaisyChain_Init(void);
 static void DaisyChain_Send(uint8_t type);
 static void DaisyChain_ProcessRx(void);
 static void DaisyChain_Poll(void);
 static void DaisyChain_BlinkLed(void);
+static void DaisyChain_NotePeer(uint32_t id);
 static uint32_t DaisyChain_Rand(void);
+static void Leds_Apply(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -211,6 +273,11 @@ int main(void)
   /* RS485 daisy-chain ping/pong discovery (USART2, shared bus over both
    * RJ45 jacks). */
   DaisyChain_Init();
+
+  /* ESP32 telemetry/command link on SPI1 (PB3/PB4/PA7 + PB9 as CS). Also
+   * calibrates ADC1 and ADC2 -- they were initialised by CubeMX but never
+   * calibrated or started. */
+  Esp_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -220,22 +287,17 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* 15V-supply status housekeeping (preserved from the smoke test). */
-    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_SET)
-    {
-      /* PA15 (Fault_15V) high -> no 15V */
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
-    }
-    else
-    {
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
-    }
+    /* 15V-supply status housekeeping (preserved from the smoke test).
+     * PA15 (Fault_15V) high -> no 15V. The state is also published in the
+     * telemetry frame so the ESP32 dashboard can show it. */
+    fault_15v = (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_SET) ? 1u : 0u;
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, fault_15v ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    Leds_Apply();
 
     /* U/V/W duty is updated from the TIM1 update interrupt (Motor_PWM_Update) —
      * nothing to do for the motor drive here. */
     DaisyChain_Poll();
+    Esp_Poll();
   }
   /* USER CODE END 3 */
 }
@@ -432,11 +494,11 @@ static void MX_SPI1_Init(void)
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_4BIT;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;  /* 16 MHz / 16 = 1 MHz */
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -653,7 +715,9 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB2 PB11 PB5 PB6
-                           PB7 PB9 */
+                           PB7 PB9
+    PB9 doubles as the software-NSS chip select for the ESP32 SPI link; it is
+    driven high (idle) in Esp_Init(). */
   GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_11|GPIO_PIN_5|GPIO_PIN_6
                           |GPIO_PIN_7|GPIO_PIN_9;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -696,19 +760,36 @@ static const float sine_lut[SINE_LUT_SIZE] =
 static float motor_phase_idx = 0.0f;   /* current position in sine_lut, wraps at SINE_LUT_SIZE */
 static float motor_ramp_frac = 0.0f;   /* 0..1 progress through the start-up ramp */
 
+/* Setpoints the ESP32 can write at runtime. Read by Motor_PWM_Update() in the
+ * TIM1 ISR, written by the main loop: single 32-bit words, so each store is
+ * atomic on Cortex-M4 and no critical section is needed. */
+static volatile float motor_freq_target = ELEC_FREQ_TARGET_HZ;
+static volatile float motor_mod_target  = M_TARGET;
+static volatile float motor_mod_start   = M_START;
+static volatile float motor_ramp_step   = RAMP_STEP_PER_TICK;
+static volatile uint16_t motor_ramp_ms  = (uint16_t)(RAMP_TIME_S * 1000.0f);
+static volatile uint8_t motor_reverse   = 0;  /* 1 = swap V/W -> reverse rotation */
+
+/* LED override state. Index 0 = LED1 (PB6), 1 = LED2 (PB7). While a LED is in
+ * ESP_LED_AUTO the firmware drives it as before; otherwise the dashboard owns
+ * it and the automatic logic leaves it alone. */
+static volatile uint8_t led_mode[ESP_LED_COUNT] = { ESP_LED_AUTO, ESP_LED_AUTO };
+
+
 static void Motor_PWM_Update(void)
 {
   if (motor_ramp_frac < 1.0f)
   {
-    motor_ramp_frac += RAMP_STEP_PER_TICK;
+    motor_ramp_frac += motor_ramp_step;
     if (motor_ramp_frac > 1.0f)
     {
       motor_ramp_frac = 1.0f;
     }
   }
 
-  float elec_freq_now = motor_ramp_frac * ELEC_FREQ_TARGET_HZ;
-  float m_now = M_START + motor_ramp_frac * (M_TARGET - M_START);
+  float m_start_now = motor_mod_start;
+  float elec_freq_now = motor_ramp_frac * motor_freq_target;
+  float m_now = m_start_now + motor_ramp_frac * (motor_mod_target - m_start_now);
 
   motor_phase_idx += elec_freq_now * LUT_STEP_PER_HZ;
   if (motor_phase_idx >= (float)SINE_LUT_SIZE)
@@ -717,8 +798,11 @@ static void Motor_PWM_Update(void)
   }
 
   uint32_t idx_u = (uint32_t)motor_phase_idx % SINE_LUT_SIZE;
-  uint32_t idx_v = (idx_u + SINE_LUT_SIZE - SINE_LUT_SIZE / 3u) % SINE_LUT_SIZE;
-  uint32_t idx_w = (idx_u + SINE_LUT_SIZE / 3u) % SINE_LUT_SIZE;
+  uint32_t idx_lag  = (idx_u + SINE_LUT_SIZE - SINE_LUT_SIZE / 3u) % SINE_LUT_SIZE;
+  uint32_t idx_lead = (idx_u + SINE_LUT_SIZE / 3u) % SINE_LUT_SIZE;
+  /* Swapping which of V/W leads reverses the rotating field. */
+  uint32_t idx_v = motor_reverse ? idx_lead : idx_lag;
+  uint32_t idx_w = motor_reverse ? idx_lag  : idx_lead;
 
   uint32_t ccu = (uint32_t)((float)(PWM_ARR / 2u) * (1.0f + m_now * sine_lut[idx_u]));
   uint32_t ccv = (uint32_t)((float)(PWM_ARR / 2u) * (1.0f + m_now * sine_lut[idx_v]));
@@ -727,6 +811,27 @@ static void Motor_PWM_Update(void)
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccu);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccv);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccw);
+}
+
+/* LED1 (PB6) normally mirrors "15V present"; LED2 (PB7) is blinked by the
+ * daisy chain. Either can be taken over from the dashboard. */
+static void Leds_Apply(void)
+{
+  if (led_mode[0] == ESP_LED_AUTO)
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, fault_15v ? GPIO_PIN_RESET : GPIO_PIN_SET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6,
+                      (led_mode[0] == ESP_LED_ON) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  }
+
+  if (led_mode[1] != ESP_LED_AUTO)
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7,
+                      (led_mode[1] == ESP_LED_ON) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  }
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
@@ -746,6 +851,10 @@ static uint8_t dc_rx_ring[DC_RX_BUF_LEN];
 static volatile uint16_t dc_rx_head = 0;  /* written by the RX-complete ISR */
 static uint16_t dc_rx_tail = 0;           /* read by the main loop */
 
+static uint32_t dc_peer_id[DC_MAX_PEERS];
+static uint32_t dc_peer_seen[DC_MAX_PEERS];   /* HAL_GetTick() of last frame */
+static uint8_t dc_peer_count = 0;
+
 static uint32_t dc_rand_state;
 static uint32_t dc_next_ping_tick = 0;
 static uint32_t dc_led_off_tick = 0;
@@ -762,8 +871,48 @@ static uint32_t DaisyChain_Rand(void)
 
 static void DaisyChain_BlinkLed(void)
 {
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET); /* LED2 */
-  dc_led_off_tick = HAL_GetTick() + DC_LED_BLINK_MS;
+  if (led_mode[1] == ESP_LED_AUTO)
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET); /* LED2 */
+    dc_led_off_tick = HAL_GetTick() + DC_LED_BLINK_MS;
+  }
+  dc_peer_frames++;   /* also reported in the telemetry frame */
+}
+
+/* Remember which boards are on the chain. The table is tiny and searched
+ * linearly -- DC_MAX_PEERS is 4. When it is full the least recently heard
+ * entry is evicted, so a board that drops off eventually makes room. */
+static void DaisyChain_NotePeer(uint32_t id)
+{
+  uint32_t now = HAL_GetTick();
+
+  for (uint8_t i = 0; i < dc_peer_count; i++)
+  {
+    if (dc_peer_id[i] == id)
+    {
+      dc_peer_seen[i] = now;
+      return;
+    }
+  }
+
+  if (dc_peer_count < DC_MAX_PEERS)
+  {
+    dc_peer_id[dc_peer_count] = id;
+    dc_peer_seen[dc_peer_count] = now;
+    dc_peer_count++;
+    return;
+  }
+
+  uint8_t oldest = 0;
+  for (uint8_t i = 1; i < DC_MAX_PEERS; i++)
+  {
+    if ((int32_t)(dc_peer_seen[i] - dc_peer_seen[oldest]) < 0)
+    {
+      oldest = i;
+    }
+  }
+  dc_peer_id[oldest] = id;
+  dc_peer_seen[oldest] = now;
 }
 
 static void DaisyChain_Send(uint8_t type)
@@ -822,6 +971,7 @@ static void DaisyChain_ProcessRx(void)
     }
 
     DaisyChain_BlinkLed();
+    DaisyChain_NotePeer(sender_id);
 
     if (frame[2] == DC_TYPE_PING)
     {
@@ -869,7 +1019,10 @@ static void DaisyChain_Poll(void)
 
   if (dc_led_off_tick != 0u && (int32_t)(HAL_GetTick() - dc_led_off_tick) >= 0)
   {
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+    if (led_mode[1] == ESP_LED_AUTO)
+    {
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+    }
     dc_led_off_tick = 0u;
   }
 }
@@ -881,6 +1034,331 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     dc_rx_ring[dc_rx_head] = dc_rx_byte;
     dc_rx_head = (uint16_t)((dc_rx_head + 1u) % DC_RX_BUF_LEN);
     HAL_UART_Receive_IT(&huart2, &dc_rx_byte, 1);
+  }
+}
+
+/* ===== ESP32 telemetry / command link (SPI1 master, PB3/PB4/PA7 + PB9 CS) ==
+ *
+ * One fixed-length full-duplex transfer per period: the telemetry frame is
+ * clocked out on MOSI while the ESP32's command frame arrives on MISO. The
+ * ESP32 runs as an SPI slave and stages its reply before the transfer starts,
+ * so the command it returns is always the one it prepared last time round --
+ * that one-frame lag is why commands carry a sequence number.
+ *
+ * Telemetry frame (STM32 -> ESP32), 72 bytes, little-endian:
+ *    0     0xA5 sync
+ *    1     0x5A sync
+ *    2-3   VDC        4-5   VU        6-7   VV (always 0)
+ *    8-9   VW        10-11  IU       12-13  IV       14-15  IW
+ *    16    flags: bit0 = 15V fault, bit1 = outputs enabled,
+ *                 bit2 = reverse, bit3 = PB10 input level
+ *    17    number of daisy-chain peers in the table
+ *    18-21 total RS485 frames seen from other boards
+ *    22-23 electrical frequency setpoint, centi-Hz
+ *    24-25 modulation index target, milli-units
+ *    26-29 this board's id
+ *    30-31 modulation index at start of ramp, milli-units
+ *    32-33 ramp time, milliseconds
+ *    34-35 live ramp progress, milli (0..1000)
+ *    36-37 PWM_ARR (carrier = 16 MHz / (2 * ARR))
+ *    38    LED1 mode      39   LED2 mode   (0 auto, 1 on, 2 off)
+ *    40-63 peer table: 4 entries of { u32 id, u16 age in 10 ms units }
+ *    64-69 reserved
+ *    70    XOR checksum of bytes 0..69
+ *    71    padding
+ *
+ * Command frame (ESP32 -> STM32), 72 bytes:
+ *    0     0xC3 sync
+ *    1     0x3C sync
+ *    2     command id
+ *    3     sequence number -- acted on only when it changes
+ *    4-5   argument
+ *    6-70  reserved
+ *    71    XOR checksum of bytes 0..70
+ */
+
+static uint8_t esp_tx_frame[ESP_FRAME_LEN];
+static uint8_t esp_rx_frame[ESP_FRAME_LEN];
+static uint32_t esp_next_tick = 0;
+static uint8_t esp_last_seq = 0;
+static uint8_t esp_seq_valid = 0;
+
+/* Single-shot read of one regular channel. ScanConvMode is disabled and
+ * NbrOfConversion is 1, so rank 1 is re-pointed at each channel in turn. */
+static uint16_t ADC_ReadChannel(ADC_HandleTypeDef *hadc, uint32_t channel)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+  uint16_t value = 0;
+
+  sConfig.Channel      = channel;
+  sConfig.Rank         = ADC_REGULAR_RANK_1;
+  /* 247.5 cycles: the sense pins are fed by high-impedance resistive
+   * dividers, which the 2.5-cycle default cannot settle. */
+  sConfig.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;
+  sConfig.SingleDiff   = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset       = 0;
+  if (HAL_ADC_ConfigChannel(hadc, &sConfig) != HAL_OK)
+  {
+    return 0;
+  }
+  if (HAL_ADC_Start(hadc) != HAL_OK)
+  {
+    return 0;
+  }
+  if (HAL_ADC_PollForConversion(hadc, 5) == HAL_OK)
+  {
+    value = (uint16_t)HAL_ADC_GetValue(hadc);
+  }
+  HAL_ADC_Stop(hadc);
+  return value;
+}
+
+static void Esp_PutU16(uint8_t *p, uint16_t v)
+{
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+}
+
+static void Esp_PutU32(uint8_t *p, uint32_t v)
+{
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+  p[2] = (uint8_t)(v >> 16);
+  p[3] = (uint8_t)(v >> 24);
+}
+
+static uint8_t Esp_Checksum(const uint8_t *p, uint32_t n)
+{
+  uint8_t x = 0;
+  for (uint32_t i = 0; i < n; i++)
+  {
+    x ^= p[i];
+  }
+  return x;
+}
+
+static void Esp_BuildTelemetry(void)
+{
+  /* Channel map comes from Repository.ioc:
+   *   VDC PB12 ADC1_IN11 | VU PB1 ADC1_IN12 | VW PA6 ADC2_IN3
+   *   IU  PA0  ADC1_IN1  | IV PA4 ADC2_IN17 | IW PB0 ADC1_IN15
+   * VV has no ADC channel: PB2 is configured as a GPIO output in both .ioc
+   * files, so the README's "VV = PB2 = ADC2_IN12" was never true for this
+   * pinout. It is sent as 0. To get a real VV, reassign PB2 to ADC2_IN12 in
+   * CubeMX and read ADC_CHANNEL_12 on hadc2 here. */
+  uint16_t vdc = ADC_ReadChannel(&hadc1, ADC_CHANNEL_11);
+  uint16_t vu  = ADC_ReadChannel(&hadc1, ADC_CHANNEL_12);
+  uint16_t vw  = ADC_ReadChannel(&hadc2, ADC_CHANNEL_3);
+  uint16_t iu  = ADC_ReadChannel(&hadc1, ADC_CHANNEL_1);
+  uint16_t iv  = ADC_ReadChannel(&hadc2, ADC_CHANNEL_17);
+  uint16_t iw  = ADC_ReadChannel(&hadc1, ADC_CHANNEL_15);
+
+  uint8_t flags = 0;
+  if (fault_15v)                                          { flags |= 0x01u; }
+  if (htim1.Instance->BDTR & TIM_BDTR_MOE)                { flags |= 0x02u; }
+  if (motor_reverse)                                      { flags |= 0x04u; }
+  if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10) == GPIO_PIN_SET) { flags |= 0x08u; }
+
+  for (uint32_t i = 0; i < ESP_FRAME_LEN; i++)
+  {
+    esp_tx_frame[i] = 0;
+  }
+  esp_tx_frame[0] = ESP_TX_SYNC0;
+  esp_tx_frame[1] = ESP_TX_SYNC1;
+  Esp_PutU16(&esp_tx_frame[2],  vdc);
+  Esp_PutU16(&esp_tx_frame[4],  vu);
+  Esp_PutU16(&esp_tx_frame[6],  0u);   /* VV: no ADC channel on this pinout */
+  Esp_PutU16(&esp_tx_frame[8],  vw);
+  Esp_PutU16(&esp_tx_frame[10], iu);
+  Esp_PutU16(&esp_tx_frame[12], iv);
+  Esp_PutU16(&esp_tx_frame[14], iw);
+  esp_tx_frame[16] = flags;
+  esp_tx_frame[17] = dc_peer_count;
+  Esp_PutU32(&esp_tx_frame[18], dc_peer_frames);
+  Esp_PutU16(&esp_tx_frame[22], (uint16_t)(motor_freq_target * 100.0f));
+  Esp_PutU16(&esp_tx_frame[24], (uint16_t)(motor_mod_target * 1000.0f));
+  Esp_PutU32(&esp_tx_frame[26], board_id);
+  Esp_PutU16(&esp_tx_frame[30], (uint16_t)(motor_mod_start * 1000.0f));
+  Esp_PutU16(&esp_tx_frame[32], motor_ramp_ms);
+  Esp_PutU16(&esp_tx_frame[34], (uint16_t)(motor_ramp_frac * 1000.0f));
+  Esp_PutU16(&esp_tx_frame[36], (uint16_t)PWM_ARR);
+  esp_tx_frame[38] = led_mode[0];
+  esp_tx_frame[39] = led_mode[1];
+
+  /* Peer table. Age is in 10 ms units so a 16-bit field covers ~11 minutes;
+   * anything older saturates. */
+  uint32_t now = HAL_GetTick();
+  for (uint8_t i = 0; i < DC_MAX_PEERS; i++)
+  {
+    uint8_t *slot = &esp_tx_frame[40 + (i * 6u)];
+    if (i < dc_peer_count)
+    {
+      uint32_t age = (now - dc_peer_seen[i]) / 10u;
+      if (age > 0xFFFFu) { age = 0xFFFFu; }
+      Esp_PutU32(&slot[0], dc_peer_id[i]);
+      Esp_PutU16(&slot[4], (uint16_t)age);
+    }
+    else
+    {
+      Esp_PutU32(&slot[0], 0u);
+      Esp_PutU16(&slot[4], 0u);
+    }
+  }
+
+  esp_tx_frame[70] = Esp_Checksum(esp_tx_frame, 70);
+}
+
+static void Esp_ApplyCommand(const uint8_t *frame)
+{
+  if (frame[0] != ESP_RX_SYNC0 || frame[1] != ESP_RX_SYNC1)
+  {
+    return;   /* no ESP32 attached, or it had nothing staged yet */
+  }
+  if (Esp_Checksum(frame, ESP_FRAME_LEN - 1u) != frame[ESP_FRAME_LEN - 1u])
+  {
+    return;
+  }
+
+  uint8_t seq = frame[3];
+  if (esp_seq_valid && seq == esp_last_seq)
+  {
+    return;   /* same command still sitting in the ESP32's buffer */
+  }
+  esp_last_seq = seq;
+  esp_seq_valid = 1;
+
+  uint16_t arg = (uint16_t)frame[4] | ((uint16_t)frame[5] << 8);
+
+  switch (frame[2])
+  {
+    case ESP_CMD_SET_FREQ:
+    {
+      /* Open loop with no current limiting, so refuse to be driven somewhere
+       * the drive cannot follow. */
+      float v = (float)arg / 100.0f;
+      if (v > 100.0f) { v = 100.0f; }
+      motor_freq_target = v;
+      break;
+    }
+    case ESP_CMD_SET_MOD:
+    {
+      float v = (float)arg / 1000.0f;
+      if (v > 0.95f) { v = 0.95f; }
+      motor_mod_target = v;
+      break;
+    }
+    case ESP_CMD_START:
+      motor_ramp_frac = 0.0f;   /* re-run the alignment/ramp from zero */
+      motor_phase_idx = 0.0f;
+      __HAL_TIM_MOE_ENABLE(&htim1);
+      break;
+
+    case ESP_CMD_STOP:
+      /* Clearing MOE tri-states all six IPM inputs immediately. */
+      __HAL_TIM_MOE_DISABLE(&htim1);
+      break;
+
+    case ESP_CMD_PING:
+      DaisyChain_Send(DC_TYPE_PING);
+      break;
+
+    case ESP_CMD_SET_MOD_START:
+    {
+      float v = (float)arg / 1000.0f;
+      if (v > 0.95f) { v = 0.95f; }
+      motor_mod_start = v;
+      break;
+    }
+    case ESP_CMD_SET_RAMP_MS:
+    {
+      /* Guard the divide: a zero ramp would make the step infinite. */
+      uint16_t ms = arg;
+      if (ms < 100u) { ms = 100u; }
+      motor_ramp_ms = ms;
+      motor_ramp_step = 1.0f / (((float)ms / 1000.0f) * PWM_UPDATE_HZ);
+      break;
+    }
+    case ESP_CMD_SET_DIR:
+      motor_reverse = (arg != 0u) ? 1u : 0u;
+      break;
+
+    case ESP_CMD_SET_LED:
+    {
+      uint8_t idx  = (uint8_t)(arg & 0xFFu);
+      uint8_t mode = (uint8_t)(arg >> 8);
+      if (idx < ESP_LED_COUNT && mode <= ESP_LED_OFF)
+      {
+        led_mode[idx] = mode;
+        /* LED2 is only ever written by the blink path, so handing it back to
+         * AUTO while it happens to be lit would strand it on until the next
+         * peer frame. Clear it here instead. */
+        if (idx == 1u && mode == ESP_LED_AUTO)
+        {
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+          dc_led_off_tick = 0u;
+        }
+      }
+      break;
+    }
+
+    case ESP_CMD_NOP:
+    default:
+      break;
+  }
+}
+
+static void Esp_Exchange(void)
+{
+  Esp_BuildTelemetry();
+
+  /* Software NSS: frame the transfer with PB9. The ESP32's SPI slave uses the
+   * CS edges to delimit the transaction, so it must fall before the first
+   * clock and rise after the last. */
+  HAL_GPIO_WritePin(ESP_CS_PORT, ESP_CS_PIN, GPIO_PIN_RESET);
+  ESP_CS_SETTLE();   /* CS setup before the first clock edge */
+  HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, esp_tx_frame,
+                                                 esp_rx_frame, ESP_FRAME_LEN, 20);
+  ESP_CS_SETTLE();   /* CS hold after the last clock edge */
+  HAL_GPIO_WritePin(ESP_CS_PORT, ESP_CS_PIN, GPIO_PIN_SET);
+
+  if (st == HAL_OK)
+  {
+    Esp_ApplyCommand(esp_rx_frame);
+  }
+  else
+  {
+    /* A timeout leaves the peripheral mid-word; reset it so the next transfer
+     * starts on a word boundary. */
+    HAL_SPI_Abort(&hspi1);
+  }
+}
+
+static void Esp_Init(void)
+{
+  /* ADC1/ADC2 were initialised by CubeMX but never calibrated or started.
+   * Calibration must run while the ADC is disabled, i.e. before any read. */
+  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* CS idles high. MX_GPIO_Init() already made PB9 a push-pull output. */
+  HAL_GPIO_WritePin(ESP_CS_PORT, ESP_CS_PIN, GPIO_PIN_SET);
+
+  esp_next_tick = HAL_GetTick() + ESP_PERIOD_MS;
+}
+
+static void Esp_Poll(void)
+{
+  if ((int32_t)(HAL_GetTick() - esp_next_tick) >= 0)
+  {
+    Esp_Exchange();
+    esp_next_tick = HAL_GetTick() + ESP_PERIOD_MS;
   }
 }
 

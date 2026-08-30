@@ -21,8 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import serial
 
-SERIAL_PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyUSB0"
-BAUD = 57600
+SERIAL_PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"   # ESP32-C3 native USB
+BAUD = 115200   # ESP32 bridge (was 57600 for the old Arduino SoftwareSerial bridge)
 HTTP_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 
 # Values are shown as raw 12-bit ADC counts (0-4095).
